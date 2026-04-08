@@ -38,6 +38,20 @@
     - Dựa trên MVCC + snapshot; mỗi transaction thấy version data tại thời điểm bắt đầu
     - Tránh: dirty read, non-repeatable read (tuỳ isolation level)
     - Write conflict được serialize bằng row-level lock
+    - Isolation level:
+        - Read Uncommitted:
+            - cho phép dirty read (nhưng PostgreSQL thực tế = Read Committed)
+        - Read Committed (default):
+            - chỉ đọc data đã commit
+            - có thể xảy ra non-repeatable read, phantom read
+        - Repeatable Read:
+            - snapshot tại start transaction
+            - không có dirty read, non-repeatable read
+            - (Postgres) gần như không có phantom read
+        - Serializable:
+            - strongest isolation
+            - đảm bảo như chạy tuần tự (serial execution)
+            - có thể bị rollback (serialization failure)
 
 - Durability
     - COMMIT = WAL fsync thành công; crash → replay WAL → không mất data đã commit; full page write giúp tránh corrupted page khi crash
