@@ -2,15 +2,40 @@
 
 ## Core Concept
 
+- Kafka gồm control plane (metadata management) và data plane (message storage/replication). Control plane dùng KRaft (Raft consensus) để quản lý metadata; data plane dùng log-based storage để lưu message.
 - Kafka = distributed append-only log system; Data model: topic → partition → offset; mỗi partition = 1 log tuần tự
 
 ## Storage (cách lưu data)
 
 - Data ghi append-only vào disk (sequential I/O); không update in-place; file chia thành segment; OS page cache dùng để cache read
+- Segment là đơn vị vật lý của một partition. Mỗi partition được chia thành nhiều segment file để tối ưu lưu trữ, xóa dữ liệu và truy xuất
+  Mỗi segment gồm 3 file chính:
+- `.log`: chứa dữ liệu message thật (append-only log)
+- `.index`: map offset → vị trí byte trong file .log, giúp nhảy nhanh đến vị trí dữ liệu theo offset thay vì scan toàn file
+- `.timeindex`: map timestamp → offset gần nhất, giúp tìm offset theo thời gian (time-based lookup)
+
+- Lợi ích của segment:
+    - Xóa dữ liệu nhanh (retention xóa theo segment, không xóa từng message)
+    - Tăng hiệu năng đọc (index + segment giúp random access nhanh)
+    - Tăng hiệu quả recovery khi restart broker
+    - Giảm chi phí quản lý file lớn (tránh 1 file log khổng lồ)
 
 ## Partition & replication
 
-- Mỗi partition có: 1 leader, N follower; leader xử lý read/write; follower replicate từ leader
+- Partition là đơn vị nhỏ nhất của parallelism trong Kafka topic. Kafka chỉ đảm bảo ordering trong một partition, không đảm bảo giữa các partition.
+- Mỗi partition có: 1 leader, N follower. Leader xử lý read/write (produce + fetch request). Follower replicate dữ liệu từ leader theo cơ chế append-only log
+
+- ISR (In-Sync Replicas) là tập các replica còn đồng bộ với leader, tức là không bị lag quá ngưỡng (ví dụ replica.lag.time.max.ms hoặc cơ chế kiểm tra lag tương đương). Chỉ các replica nằm trong ISR mới được dùng để đảm bảo durability
+- High Watermark là offset cao nhất đã được commit an toàn; consumer chỉ đọc tới mức này để đảm bảo consistency
+- Failure handling: leader crash → controller chọn leader mới từ ISR; follower lag quá xa → bị loại khỏi ISR; nếu ISR rỗng thì có thể block ghi (an toàn) hoặc cho phép unclean leader election (có nguy cơ mất data)
+
+- Lợi ích của partition:
+    - Tăng throughput write: nhiều partition → nhiều leader → nhiều luồng ghi song song
+    - Tăng throughput read: consumer group có thể scale ngang bằng cách tăng số consumer (mỗi consumer xử lý 1 hoặc nhiều partition)
+    - Cho phép parallel processing theo key ordering:
+
+- Producer gửi record có key -> Kafka xác định partition bằng hash `partition = hash(key) % num_partitions`. Cùng key luôn vào cùng partition, nên giữ ordering theo key. Không có key thì dùng sticky hoặc round-robin partitioning để cân bằng tải.
+- Thay đổi số partition có thể làm đổi mapping, từ đó phá ordering theo key.
 
 ## Write flow (data)
 
@@ -22,39 +47,74 @@
 
 ## Read flow
 
-- Consumer đọc theo offset; pull model (consumer fetch); offset = position trong log
+- Consumer hoạt động theo pull model: consumer chủ động fetch dữ liệu từ broker (Consumer tự quyết định batch size, tốc độ consume và backpressure.), khác với push model (như RabbitMQ), nơi broker đẩy dữ liệu tới consumer.
+
+1. Consumer gửi fetch request (topic, partition, offset)
+2. Broker (leader) đọc data từ log (disk hoặc page cache)
+3. Trả batch record cho consumer
+4. Consumer xử lý và update offset (local hoặc commit)
+
+- Offset là index tuần tự cho record trong partition (0 → n), consumer dùng offset để resume khi restart
+- Consumer group giúp scale parallel consumption, mỗi partition chỉ được assign cho 1 consumer trong group
+
+- Read consistency: consumer chỉ đọc được data đã commit (đã replicated); data chưa commit có thể bị mất nếu leader crash
 
 ## Retention
 
-- Xoá theo: time (retention.ms), size (retention.bytes); log compaction: giữ latest value theo key
+- Có 3 cơ chế:
+    - Time-based (retention.ms): xoá data theo thời gian
+    - Size-based (retention.bytes): xoá khi vượt dung lượng
+    - Log compaction: giữ latest value theo key (không xoá theo time/size)
+
+- Retention (time/size)
+    - Kafka xoá theo segment (không xoá từng record)
+    - Khi vượt threshold → xoá segment cũ
+
+- Log compaction
+    - Giữ lại record mới nhất theo key, xoá các record cũ cùng key
+    - Chạy background (log cleaner)
+    - Không xảy ra ngay (eventual cleanup)
+    - Dùng cho:
+        - state store
+        - \_\_consumer_offsets
+        - changelog/event sourcing
 
 ## KRaft (metadata management)
 
-- Kafka tự quản lý metadata (không dùng ZooKeeper); dùng Raft consensus
+- Kafka tự quản lý metadata (không dùng ZooKeeper); dùng Raft consensus; 1 leader (active controller)
 
 ## Metadata storage
 
+### Control plane metadata
+
 - Metadata lưu trong topic: \_\_cluster_metadata; 1 partition duy nhất chứa toàn bộ state; mỗi thay đổi = 1 record append vào log
 - Metadata chứa: cluster info (clusterId, quorum), broker (id, host, trạng thái), topic (name, config), partition (leader, ISR, replica, epoch), ACL/security, config, feature/version
+- Replication chỉ giữa controller (Raft quorum). Broker fetch metadata mới từ controller và build state trong RAM
 
-## Controller quorum
+- Write flow (metadata):
+    1. Broker gửi request (create topic, update…)
+    2. Controller leader nhận
+    3. Append vào metadata log
+    4. Replicate tới quorum
+    5. Majority ACK → commit
+    6. Broker fetch metadata mới
 
-- Nhóm controller node dùng Raft; 1 leader (active controller); commit khi majority ACK
+### Data plane metadata
 
-## Write flow (metadata)
+- Dùng log compaction (giữ offset mới nhất)
+- Consumer metadata lưu trong topic: \_\_consumer_offsets; nhiều partition (scale theo consumer group); dùng log compaction (giữ offset mới nhất)
+- Consumer metadata chứa group metadata: group.id, member, assignment, generation, offset: topic, partition, committed offset
 
-1. Broker gửi request (create topic, update…)
-2. Controller leader nhận
-3. Append vào metadata log
-4. Replicate tới quorum
-5. Majority ACK → commit
-6. Broker fetch metadata mới
+- Write flow (consumer offset)
+    1. Consumer commit offset
+    2. Gửi request tới group coordinator (broker)
+    3. Broker ghi vào \_\_consumer_offsets
 
 ## Metadata state (runtime)
 
 - Broker: replicate metadata log, replay → build state trong RAM; RAM = MetadataCache (state hiện tại); query metadata → đọc RAM (không đọc log)
 
-## Snapshot & recovery
+## Snapshot metadata & recovery
 
 - Controller tạo snapshot định kỳ (tại offset N) để capture full metadata state → giảm chi phí replay log
 - Snapshot lưu state đã materialize (topics, partitions, ISR, config, ACL, …) tại thời điểm đó
@@ -73,35 +133,35 @@
 
 - ZooKeeper: metadata = in-memory tree; disk = backup (log + snapshot); write = random mutation
 - KRaft: metadata = append-only log; disk = source of truth; write = sequential append
+- Kraft tối ưu hơn vì append-only log tận dụng tốt disk; Raft đảm bảo consistency; không cần external system (ZooKeeper)
 
-# Kafka Operations / Production Questions
+# Kafka Interview Questions
 
 ## Cluster / Consensus (KRaft)
 
 - Nếu cluster bị network partition thì KRaft xử lý thế nào?
     - nhóm có majority controller → tiếp tục hoạt động
     - nhóm thiểu số → không commit metadata (read-only hoặc fail)
+    - không có nhóm nào có majority controller → không bầu được controller leader → cluster không commit metadata → gần như “freeze control plane”. Data plane có thể vẫn chạy tạm thời nếu leader partition chưa bị ảnh hưởng, nhưng dễ degrade nhanh khi có failure
 
 - Nếu controller leader chết thì chuyện gì xảy ra?
     - controller khác trong quorum elect leader mới (Raft election)
     - metadata log vẫn đảm bảo consistency
 
 - Bao nhiêu controller là hợp lý?
-    - 3 hoặc 5 (odd number) để đảm bảo majority quorum
+    - Chọn 3 hoặc 5 controller vì Raft yêu cầu majority quorum, và số lẻ tối ưu hóa khả năng chịu lỗi mà không tạo ra tình huống split quorum (tie vote) như số chẵn. Nếu nhiều hơn 5 controller, overhead quản lý và latency có thể tăng lên do nhiều node phải đồng bộ metadata log.
 
 - Nếu mất majority controller?
     - cluster không thể commit metadata → gần như “freeze control plane”
 
-- Split brain có xảy ra không?
+- Split brain có xảy ra không? (2 controller leader)
     - không, vì chỉ majority mới commit
 
 ## Partition / Topic
 
 - Có thể tăng partition không?
-    - có → online
-    - nhưng:
-        - ordering theo key có thể bị phá
-        - key hash mapping thay đổi
+    - có → online không downtime
+    - nhưng ordering theo key có thể bị phá do key hash mapping thay đổi (partition = hash(key) % num_partitions), nên nếu num_partitions thay đổi thì key có thể map sang partition khác → ordering theo key bị phá
 
 - Có thể giảm partition không?
     - không (Kafka không support shrink partition)
@@ -212,7 +272,7 @@
 - Broker lấy metadata như thế nào?
     - fetch log → replay → build state RAM
 
-- Metadata có bị stale không?
+- Metadata có bị stale không? (bị cũ)
     - có thể lag nếu broker chưa catch up
 
 - Snapshot để làm gì?
@@ -230,8 +290,6 @@
 - Nếu DNS / LB fail?
     - client retry broker khác
 
----
-
 ## Security / Config
 
 - Kafka có hỗ trợ auth không?
@@ -239,8 +297,6 @@
 
 - ACL hoạt động thế nào?
     - kiểm soát read/write per topic/group
-
----
 
 ## Monitoring / Debug
 
@@ -260,18 +316,3 @@
     - GC
     - network
     - partition skew
-
----
-
-## TL;DR
-
-- Kafka fail chủ yếu ở:
-    - replication / ISR
-    - controller quorum
-    - disk / network
-
-- Scale bằng:
-    - partition
-
-- Consistency dựa vào:
-    - leader + replication + ack
